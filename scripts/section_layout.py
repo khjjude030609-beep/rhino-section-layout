@@ -43,6 +43,14 @@ PART = [('WOOD', ('장선', '멍에', '트러스', '서까래', '도리', '마�
         ('CONC', ('슬래브', '바닥판', '기초', '받침')),
         ('BRICK', ('벽', '파라펫', 'wall', 'parapet'))]   # 파라펫 = 조적 가정
 
+# 평면(axis='z')에서 계단: 잘린 면 대신 잘림표시(지그재그 사선). CFG stair_break=False 면 끔
+STAIR = ('계단', 'stair')
+STAIR_NOT = ('난간', '손잡이', '핸드레일', 'rail', 'baluster')
+
+def _is_stair(path, element=''):
+    t = element + '::' + path.split('::')[-1]               # 끝 이름·태그만 ('계단실' 레이어 안의 벽은 계단 아님)
+    return any(_hit(w, t) for w in STAIR) and not any(_hit(w, t) for w in STAIR_NOT)
+
 def _hit(w, t):
     if not w.isascii(): return w in t
     # 영문은 낱말 앞머리만 (CLOSED_BREPS 의 EPS, PLYWOOD 의 wood 오판 방지). 대문자 약어는 대소문자 구분
@@ -80,7 +88,9 @@ HATCH = {'BRICK': ('S-BRICK', None, 1.0, 'model'),        # AR-BRSTD(길이쌓�
          'MORTAR': ('S-AR-SAND', 'AR-SAND', 0.03, 'paper'),
          'STONE': ('S-GRAVEL', 'GRAVEL', 0.03, 'paper'),
          'INSUL': ('S-INSUL', 'INSUL', 0.25, 'paper'),
-         'SOLID': ('SOLID', None, 1.0, 'paper'), 'WHITE': (None, None, 1.0, 'paper')}
+         'SOLID': ('SOLID', None, 1.0, 'paper'), 'WHITE': (None, None, 1.0, 'paper'),
+         'STAIR': (None, None, 1.0, 'paper')}             # 평면 계단: 칠하지 않고 잘림표시만 (아래 BREAK)
+BREAK = dict(tilt=30, over=0.8, zig=1.2, amp=1.0, w=0.25)   # 잘림표시: 기울기°, 양끝 넘침·지그재그 폭·높이 (종이 mm), 선 굵기
 FALLBACK = {'S-AR-CONC': [(0, (0, 180), [20, -160]), (60, (90, 180), [20, -160])], 'S-ANSI31': [(45, (0, 3.175), [])],
             'S-EARTH': [(0, (0, 6.35), [6.35, -6.35]), (90, (6.35, 6.35), [6.35, -6.35])],
             'S-WOOD': [(0, (0, 4), [10, -2])], 'S-AR-SAND': [(37.5, (28.5, 39.8), [0, -40])],
@@ -165,7 +175,7 @@ def _axis(cfg):
 
 def _span(b, i): return (b.Min[i], b.Max[i])
 
-ORDER = ['WHITE', 'EARTH', 'CONC', 'MORTAR', 'STONE', 'INSUL', 'BRICK', 'WOOD', 'SOLID']   # 나중 것이 위 (콘크리트 속 장선 등). 재료 모름은 맨 아래
+ORDER = ['WHITE', 'EARTH', 'CONC', 'MORTAR', 'STONE', 'INSUL', 'BRICK', 'WOOD', 'SOLID', 'STAIR']   # 나중 것이 위 (콘크리트 속 장선 등). 재료 모름은 맨 아래
 
 def section(cfg, ls=None, skip=()):
     """단면선 + 흰 가림 + 재질 해치 + 합친 외곽선을 '페이지 공간'에 그림 (cfg['page'] 의 첫 디테일 위).
@@ -197,6 +207,20 @@ def section(cfg, ls=None, skip=()):
         cs = sec[k]
         u = Rhino.Geometry.Curve.CreateBooleanUnion(cs, tol)   # 블록 이음매 없애기
         regs = list(u) if u and len(u) > 0 else cs
+        if k == 'STAIR':                                    # 평면 계단: 잘린 면 대신 잘림표시 (계단 폭을 비스듬히 가로지르는 지그재그)
+            for cv in regs:
+                x = _wall_dir(cv)
+                am = Rhino.Geometry.AreaMassProperties.Compute(cv)
+                if not x or not am: continue
+                c0 = xf * am.Centroid
+                u_ = xf * Vector3d(math.cos(x['ang']), math.sin(x['ang']), 0); u_.Unitize()   # 잘린 띠의 긴 쪽 = 계단 폭 방향
+                n_ = Vector3d(-u_.Y, u_.X, 0)
+                t_ = math.radians(BREAK['tilt'])
+                b_ = u_ * math.cos(t_) + n_ * math.sin(t_); nb = Vector3d(-b_.Y, b_.X, 0)
+                Lb = x['L'] / scale / math.cos(t_) + 2 * BREAK['over']; z_, h_ = BREAK['zig'], BREAK['amp']
+                pts_ = [c0 - b_ * (Lb / 2), c0 - b_ * z_, c0 - b_ * (z_ / 3) + nb * h_, c0 + b_ * (z_ / 3) - nb * h_, c0 + b_ * z_, c0 + b_ * (Lb / 2)]
+                d.Objects.AddPolyline(Rhino.Geometry.Polyline(pts_), att(K, BREAK['w'], 3))
+            stat[k] = (len(cs), len(regs)); continue
         pats = _pats(k, ax == 'z'); fill = pats[0][0] == 'SOLID'
         pregs = [P(cv) for cv in regs]
         for h in Rhino.Geometry.Hatch.Create(pregs, solid, 0.0, 1.0, ptol) or []:   # 1) 흰 가림 (뒤 선 숨김)
@@ -366,32 +390,53 @@ def _wall_parts(x, tol):
             out.append((q, r + g * math.pi / 2, base))
     return out or one
 
+def _leaves(ob, X=None, parent=None, depth=0):
+    """객체 → (모델 좌표 기하, 레이어 경로, element) 들. 블록(인스턴스)은 정의 속으로 들어가 변환을 곱함 (중첩 8단까지).
+    블록 속 객체의 재질은 자기 레이어로 보고, 그게 '재료 모름'이면 블록 객체의 레이어·태그를 씀"""
+    a = ob.Attributes
+    lp = d.Layers[a.LayerIndex].FullPath; el = a.GetUserString('element') or ''
+    if parent and kind(lp, el) == 'WHITE': lp, el = parent
+    if isinstance(ob, Rhino.DocObjects.InstanceObject):
+        if depth > 8: return
+        X2 = ob.InstanceXform if X is None else X * ob.InstanceXform
+        for sub in ob.InstanceDefinition.GetObjects() or []:
+            for r in _leaves(sub, X2, (lp, el), depth + 1): yield r
+    elif ob.Geometry is not None:
+        yield ob.Geometry, X, lp, el
+
 def _cut(cfg, skip=()):
-    """단면 평면으로 모델을 잘라 재질별 닫힌 곡선 {kind: [curve]} (모델 좌표)"""
-    ax = cfg.get('axis', 'x'); c = float(cfg['cut']); tol = d.ModelAbsoluteTolerance
+    """단면 평면으로 모델을 잘라 재질별 닫힌 곡선 {kind: [curve]} (모델 좌표). 블록 속까지"""
+    tol = d.ModelAbsoluteTolerance
     ax, i_, c, n, o = _axis(cfg)
     cut = Plane(o, n)
     sec = collections.defaultdict(list)
-    for ob in list(d.Objects):
-        g = ob.Geometry
-        if g is None or ob.Attributes.LayerIndex in skip or ob.Attributes.Space != Rhino.DocObjects.ActiveSpace.ModelSpace: continue
-        try: b = g.GetBoundingBox(False)
+    for top in list(d.Objects):
+        if top.Attributes.LayerIndex in skip or top.Attributes.Space != Rhino.DocObjects.ActiveSpace.ModelSpace: continue
+        try: b0 = top.Geometry.GetBoundingBox(False)
         except: continue
-        lo, hi = _span(b, i_)
+        lo, hi = _span(b0, i_)
         if not (lo < c < hi): continue
-        k = kind(d.Layers[ob.Attributes.LayerIndex].FullPath, ob.Attributes.GetUserString('element') or '')
-        if k is None: continue
-        br = g.ToBrep() if isinstance(g, (Rhino.Geometry.Extrusion, Rhino.Geometry.SubD)) else (g if isinstance(g, Rhino.Geometry.Brep) else None)
-        cs = []
-        if (br is not None and not br.IsSolid) or (isinstance(g, Rhino.Geometry.Mesh) and not g.IsClosed):
-            continue                                        # 열린 면은 잘린 면이 안 됨(쐐기·겹선) → Technical 선에 맡김
-        if br is not None:
-            ok, crv, pts = Rhino.Geometry.Intersect.Intersection.BrepPlane(br, cut, tol)
-            if ok and crv: cs = list(Rhino.Geometry.Curve.JoinCurves(crv, tol * 10))
-        elif isinstance(g, Rhino.Geometry.Mesh):
-            pl = Rhino.Geometry.Intersect.Intersection.MeshPlane(g, cut)
-            if pl: cs = [p.ToNurbsCurve() for p in pl]
-        sec[k] += [x for x in cs if x.IsClosed]
+        for g, X, lp, el in _leaves(top):
+            if X is not None:                               # 블록 속: 변환한 범위로 먼저 거르고 걸리는 것만 복제
+                try: b = g.GetBoundingBox(X)
+                except: continue
+                lo, hi = _span(b, i_)
+                if not (lo < c < hi): continue
+                g = g.Duplicate(); g.Transform(X)
+            k = kind(lp, el)
+            if k is None: continue
+            if ax == 'z' and cfg.get('stair_break', True) and _is_stair(lp, el): k = 'STAIR'   # 평면 계단 → 잘림표시
+            br = g.ToBrep() if isinstance(g, (Rhino.Geometry.Extrusion, Rhino.Geometry.SubD)) else (g if isinstance(g, Rhino.Geometry.Brep) else None)
+            if (br is not None and not br.IsSolid) or (isinstance(g, Rhino.Geometry.Mesh) and not g.IsClosed):
+                continue                                    # 열린 면은 잘린 면이 안 됨(쐐기·겹선) → Technical 선에 맡김
+            cs = []
+            if br is not None:
+                ok, crv, pts = Rhino.Geometry.Intersect.Intersection.BrepPlane(br, cut, tol)
+                if ok and crv: cs = list(Rhino.Geometry.Curve.JoinCurves(crv, tol * 10))
+            elif isinstance(g, Rhino.Geometry.Mesh):
+                pl = Rhino.Geometry.Intersect.Intersection.MeshPlane(g, cut)
+                if pl: cs = [p.ToNurbsCurve() for p in pl]
+            sec[k] += [x for x in cs if x.IsClosed]
     return sec
 
 SCALES = [20, 30, 50, 75, 100, 150, 200, 250, 300, 500]
