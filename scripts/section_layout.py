@@ -45,7 +45,7 @@ PART = [('WOOD', ('장선', '멍에', '트러스', '서까래', '도리', '마�
 
 # 평면(axis='z')에서 계단: 잘린 면 대신 잘림표시(지그재그 사선). CFG stair_break=False 면 끔
 STAIR = ('계단', 'stair')
-STAIR_NOT = ('난간', '손잡이', '핸드레일', 'rail', 'baluster')
+STAIR_NOT = ('난간', '손잡이', '핸드레일', '기초', 'rail', 'baluster', 'footing')   # '줄기초 계단' = 계단식 기초
 
 def _is_stair(path, element=''):
     t = element + '::' + path.split('::')[-1]               # 끝 이름·태그만 ('계단실' 레이어 안의 벽은 계단 아님)
@@ -105,7 +105,7 @@ def _pats(k, plan=False):
     v = HATCH_PLAN.get(k, HATCH[k]) if plan else HATCH[k]
     return v if isinstance(v, list) else [v]
 WOOD_X = 400            # 이보다 작은 네모 각재 단면 = 대각선 X (나뭇결 대신, 건축 관례)
-STYLE = dict(beyond_rgb=(70, 70, 70), beyond_w=0.13, hatch_w=0.05,
+STYLE = dict(beyond_rgb=(70, 70, 70), beyond_w=0.13, hatch_w=0.05, ground_w=0.6,
              cut_w=((0.4, 0.13), (1.0, 0.25), (1e9, 0.4)))   # 단면 외곽선: (부재 두께 종이 mm 미만, 선 굵기 mm). 얇은 층·작은 각재는 가늘게
 
 def _layer(path, color=System.Drawing.Color.Black):
@@ -203,6 +203,21 @@ def section(cfg, ls=None, skip=()):
     def P(g): g = g.Duplicate(); g.Transform(xf); return g
     bp = xf * Point3d(o.X, o.Y, 0)                            # 벽돌 켜를 z=0 에 맞춤 (Point3d 는 값 형식 → 곱으로 새 점)
     solid = d.HatchPatterns.Find('SOLID', True); stat = {}
+    if cfg.get('elev'):                                    # 입면: 잘린 면은 그리지 않고 지반선만 (굵게, 건물 양옆 3 m 더)
+        k = 'STAIR'; bb = cfg['_bb']; g0 = float(cfg.get('ground', 0.0))
+        if ax == 'y': p1, p2 = Point3d(bb.Min.X - 3000, c, g0), Point3d(bb.Max.X + 3000, c, g0)
+        else: p1, p2 = Point3d(c, bb.Min.Y - 3000, g0), Point3d(c, bb.Max.Y + 3000, g0)
+        a1, a2 = xf * p1, xf * p2
+        if cfg.get('below_ground_mask', True):              # 지반선 아래(기초·땅속 선)는 흰색으로 가림
+            yb = min(a1.Y, a2.Y) - 200.0
+            rect = Rhino.Geometry.PolylineCurve([Point3d(a1.X, a1.Y, 0), Point3d(a2.X, a2.Y, 0), Point3d(a2.X, yb, 0), Point3d(a1.X, yb, 0), Point3d(a1.X, a1.Y, 0)])
+            hb = d.Objects.FindId(det.Id).Geometry.GetBoundingBox(True) if d.Objects.FindId(det.Id) else None
+            if hb is not None and hb.IsValid:                 # 그림 칸 아래 끝까지만
+                rect = Rhino.Geometry.PolylineCurve([Point3d(hb.Min.X, a1.Y, 0), Point3d(hb.Max.X, a1.Y, 0), Point3d(hb.Max.X, hb.Min.Y, 0), Point3d(hb.Min.X, hb.Min.Y, 0), Point3d(hb.Min.X, a1.Y, 0)])
+            for h in Rhino.Geometry.Hatch.Create([rect], solid, 0.0, 1.0, ptol) or []:
+                d.Objects.AddHatch(h, att(Wt, z=0))
+        d.Objects.AddLine(a1, a2, att(K, STYLE['ground_w'], 3))
+        d.Views.Redraw(); return {'ground': g0}
     for k in [x for x in ORDER if x in sec]:
         cs = sec[k]
         u = Rhino.Geometry.Curve.CreateBooleanUnion(cs, tol)   # 블록 이음매 없애기
@@ -281,8 +296,109 @@ def section(cfg, ls=None, skip=()):
             t = 2 * am.Area / pc.GetLength() if am else 0       # 띠 두께 ≈ 2·면적/둘레
             d.Objects.AddCurve(pc, att(K, next(w for lim, w in STYLE['cut_w'] if t < lim), 3))
         stat[k] = (len(cs), len(regs))
+    if ax == 'z' and cfg.get('stair_marks', True):         # 평면 계단: 아래로 내려가는 디딤판 + UP/DN 화살표
+        stat['stairs'] = _stair_marks(cfg, xf, ls, pid, scale, set(skip) | {ls})
     d.Views.Redraw()
     return stat
+
+# 평면 계단 표시: 디딤판 = 계단 객체의 위를 향한 수평 면. 화살표는 디딤판 중심을 높이순으로 이음 (곡선계단도 따라 휨)
+STAIR_MARK = dict(label=('UP', 'DN'), text_h=1.8, head=1.4, dot=0.45, w=0.18, min_tread=20000)   # label=None 이면 글자 없이 화살표만
+
+def _treads(g):
+    br = g.ToBrep() if isinstance(g, (Rhino.Geometry.Extrusion, Rhino.Geometry.SubD)) else (g if isinstance(g, Rhino.Geometry.Brep) else None)
+    if br is None: return []
+    br = br.DuplicateBrep(); br.Faces.SplitKinkyFaces(math.radians(1), True)   # 톱니 단면을 밀어낸 계단: 꺾인 한 면 → 디딤판·챌면으로 나눔
+    up, dn = [], []
+    for f in br.Faces:
+        ok, pl = f.TryGetPlane(0.5)
+        if not ok: continue
+        nv = f.NormalAt(f.Domain(0).Mid, f.Domain(1).Mid)
+        if f.OrientationIsReversed: nv = -nv
+        if abs(nv.Z) < 0.95: continue                       # 수평 면만
+        df = f.DuplicateFace(False); am = Rhino.Geometry.AreaMassProperties.Compute(df)
+        if not am or am.Area < STAIR_MARK['min_tread']: continue   # 너무 작은 면(모서리 등) 제외, mm²
+        loops = [lp.To3dCurve() for lp in f.Loops if lp.LoopType == Rhino.Geometry.BrepLoopType.Outer]
+        (up if nv.Z > 0 else dn).append((am.Centroid, loops))
+    if len(up) >= 2: return up                              # 디딤판 = 위를 향한 수평 면
+    return dn if len(dn) >= 2 else up                       # 예비: 위아래 뒤집혀 모델링된 계단 (톱니가 아래)
+
+def _stair_marks(cfg, xf, ls, pid, scale, skip):
+    c = float(cfg['cut']); floor = float(cfg.get('floor', c - 1200))   # 이 층 바닥 (기본: 자른 높이 - 1.2 m)
+    K = System.Drawing.Color.Black; G = System.Drawing.Color.FromArgb(*STYLE['beyond_rgb'])
+    def att(col, w):
+        x = Rhino.DocObjects.ObjectAttributes(); x.LayerIndex = ls; x.Space = Rhino.DocObjects.ActiveSpace.PageSpace; x.ViewportId = pid
+        x.DisplayOrder = 100; x.ColorSource = Rhino.DocObjects.ObjectColorSource.ColorFromObject; x.ObjectColor = col
+        x.PlotColorSource = Rhino.DocObjects.ObjectPlotColorSource.PlotColorFromObject; x.PlotColor = col
+        x.PlotWeightSource = Rhino.DocObjects.ObjectPlotWeightSource.PlotWeightFromObject; x.PlotWeight = w; return x
+    S = STAIR_MARK; n_up = n_dn = 0
+    for top in list(d.Objects):
+        if top.Attributes.LayerIndex in skip or top.Attributes.Space != Rhino.DocObjects.ActiveSpace.ModelSpace: continue
+        try: b0 = top.Geometry.GetBoundingBox(False)
+        except: continue
+        if b0.Max.Z < floor - 6000 or b0.Min.Z > c + 6000: continue
+        for g, X, lp, el in _leaves(top):
+            if not _is_stair(lp, el): continue
+            if X is not None: g = g.Duplicate(); g.Transform(X)
+            tr = sorted(_treads(g), key=lambda t: t[0].Z)
+            if len(tr) < 2: continue
+            z0, z1 = tr[0][0].Z, tr[-1][0].Z
+            if z0 <= c < z1 and z0 >= floor - 300:            # 이 층에서 올라감: 바닥 → 잘린 자리까지 UP
+                path = [t[0] for t in tr if t[0].Z <= c]; lab = S['label'][0] if S['label'] else None; n_up += 1
+            elif z1 <= c and z1 >= floor - 300:              # 이 층에서 내려감: 디딤판 윤곽 직접 그림 + 위 → 아래 DN
+                for _, loops in tr:
+                    for lc_ in loops:
+                        q = lc_.DuplicateCurve(); q.Transform(xf); d.Objects.AddCurve(q, att(G, STYLE['beyond_w']))
+                path = [t[0] for t in reversed(tr)]; lab = S['label'][1] if S['label'] else None; n_dn += 1
+            else: continue
+            pp = [xf * p for p in path]
+            pp2 = [pp[0]]                                     # 너무 가까운 점 정리
+            for p in pp[1:]:
+                if p.DistanceTo(pp2[-1]) > 0.5: pp2.append(p)
+            if len(pp2) < 2: continue
+            d.Objects.AddPolyline(Rhino.Geometry.Polyline(pp2), att(K, S['w']))
+            d.Objects.AddCircle(Rhino.Geometry.Circle(pp2[0], S['dot']), att(K, S['w']))   # 시작점
+            v = pp2[-1] - pp2[-2]; v.Unitize()
+            for sgn in (1, -1):                               # 화살촉
+                r = Transform.Rotation(math.radians(25 * sgn), Vector3d.ZAxis, pp2[-1])
+                h = pp2[-1] - v * S['head']; h.Transform(r); d.Objects.AddLine(pp2[-1], h, att(K, S['w']))
+            if lab:
+                v0 = pp2[1] - pp2[0]; v0.Unitize()
+                te = Rhino.Geometry.TextEntity(); te.PlainText = lab; te.TextHeight = S['text_h']
+                te.Plane = Plane(pp2[0] - v0 * (S['text_h'] * 1.6) - Vector3d(S['text_h'] * 0.8, S['text_h'] * 0.5, 0), Vector3d.ZAxis)
+                d.Objects.AddText(te, att(K, S['w']))
+    return (n_up, n_dn)
+
+def elevation(cfg):
+    """입면도: cfg['facing'] = 'S'|'N'|'E'|'W' (그 면을 바깥에서 봄). 건물 범위를 재질 있는 객체로 구해
+    면 바로 바깥(margin)에 단면판을 세우고 build. 잘린 면 없이 지반선만. ground 기본 = 흙(EARTH) 객체 윗면, 없으면 0"""
+    boxes = []; gz = []
+    for ob in d.Objects:
+        if ob.Attributes.Space != Rhino.DocObjects.ActiveSpace.ModelSpace or ob.Geometry is None: continue
+        lp = d.Layers[ob.Attributes.LayerIndex].FullPath
+        if lp.startswith(TAG): continue
+        k = kind(lp, ob.Attributes.GetUserString('element') or '')
+        try: b = ob.Geometry.GetBoundingBox(False)
+        except: continue
+        if k == 'EARTH': gz.append(b.Max.Z)
+        elif k not in (None, 'WHITE'): boxes.append(b)
+    bb = BoundingBox.Empty                                  # 멀리 떨어진 담장·대지 객체는 빼고 건물 범위 (중심 5~95 % ± 20 %)
+    if boxes:
+        lim = []
+        for j in (0, 1):
+            cs_ = sorted(b.Center[j] for b in boxes); p5, p95 = cs_[int(len(cs_) * .05)], cs_[max(int(len(cs_) * .95) - 1, 0)]
+            r = p95 - p5; lim.append((p5 - .2 * r, p95 + .2 * r))
+        for b in boxes:
+            if all(lim[j][0] <= b.Center[j] <= lim[j][1] for j in (0, 1)): bb.Union(b)
+    if cfg.get('bbox') is not None: bb = cfg['bbox']        # 직접 지정 (BoundingBox)
+    m = float(cfg.get('margin', 1000))
+    f = cfg.get('facing', 'S').upper()
+    cfg['axis'], cfg['look'], cfg['cut'] = {'S': ('y', 1, bb.Min.Y - m), 'N': ('y', -1, bb.Max.Y + m),
+                                            'W': ('x', 1, bb.Min.X - m), 'E': ('x', -1, bb.Max.X + m)}[f]
+    ext = (bb.Max.Y - bb.Min.Y) if cfg['axis'] == 'y' else (bb.Max.X - bb.Min.X)
+    cfg.setdefault('depth', ext + 2 * m)                    # 깊이판으로 건물 뒤를 막음 (없으면 벡터 PDF 숨은선 계산이 사이트 전체로 번져 빈 출력)
+    cfg.setdefault('ground', sorted(gz)[len(gz) // 2] if gz else 0.0)
+    cfg['elev'] = True; cfg['_bb'] = bb
+    return build(cfg)
 
 def _wall_dir(cv):
     """평면 벽 조각(모델 XY)의 벽 방향: 직선 변을 길이로 가중한 각도(180° 주기, 1° 칸 → 그 칸 안 평균).
@@ -478,10 +594,13 @@ def build(cfg):
     det = page.AddDetailView('section', Point2d(12, 12), Point2d(W - side - 4, H - 12), proj)
     # 카메라 중심·축척: 실제로 잘린 단면 곡선 범위 (땅·흰 덩어리 빼고). 길게 뻗은 객체 하나에 끌려가지 않음
     bb = BoundingBox.Empty
-    for k, cs in _cut(cfg, (lc, ls)).items():
-        if k in ('EARTH', 'WHITE'): continue
-        for cv in cs: bb.Union(cv.GetBoundingBox(True))
-    tgt = bb.Center; tgt = Point3d(*[c if j == i_ else tgt[j] for j in range(3)])
+    if cfg.get('_bb') is not None: bb = cfg['_bb']             # 입면: 건물 전체 범위
+    else:
+        for k, cs in _cut(cfg, (lc, ls)).items():
+            if k in ('EARTH', 'WHITE'): continue
+            for cv in cs: bb.Union(cv.GetBoundingBox(True))
+    tgt = bb.Center
+    if not cfg.get('elev'): tgt = Point3d(*[c if j == i_ else tgt[j] for j in range(3)])   # 입면은 건물 중심을 봄 (단면판에 두면 먼 쪽이 시야 밖)
     u_, v_ = {'x': (1, 2), 'y': (0, 2), 'z': (0, 1)}[ax]   # 종이 가로·세로가 되는 모델 축
     if scale == 'auto':                                   # 그림 칸에 90 % 로 들어가는 가장 큰 표준 축척
         dw, dh = (W - side - 4 - 12) * 0.9, (H - 24) * 0.9
