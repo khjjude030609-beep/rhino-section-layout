@@ -58,7 +58,7 @@ export_pdf(CFG)   # 벡터 PDF, 결과는 PDF 옆 _export_log.txt
 - `axis`: `'x'`/`'y'` = 단면, `'z'` = 평면 · `cut`: 자를 좌표(mm) · `look`: -1 / +1 보는 방향 · `depth`: 뒤로 보이는 깊이(mm)
 - 평면 예: `dict(axis='z', cut=1200, look=-1, depth=1400, scale='auto', page='1층 평면', ...)` (바닥 위 1.2 m 에서 자르고 아래를 봄)
 - `stair_break=False` 면 평면 계단도 잘린 면으로 그림, `stair_marks=False` 면 UP/DN·아래층 계단 표시 끔, `floor` = 이 층 바닥 높이(기본 cut−1200)
-- 도각·기호 예: `titleblock=r'D:\도각.dwg', tb=dict(project='...', author='...', phone='...', email='...'), rooms='rooms.json', rooms_level='1F', grid='grid.json', north=0, cuts=[dict(name='A', axis='x', at=121000, look=-1)], levels=[('1F F.L', 0), ('2F F.L', 4065)]`
+- 도각·기호 예: `titleblock=r'D:\도각.dwg', tb=dict(project='...', author='...', phone='...', email='...'), rooms='rooms.json', rooms_level='1F', grid='grid.json' (또는 grid=grid_from_layer('CAD 축선 레이어')), north=0, cuts=[dict(name='A', axis='x', at=121000, look=-1)], levels=[('1F F.L', 0), ('2F F.L', 4065)]`
   (도각 칸 맵 `TB_FIELDS` 는 예시 도각 기준이라, 다른 도각이면 `tb_fields={'원래 글자 첫 줄': '{title}'}` 처럼 바꿔 씀. 도각 DWG 는 포함 안 됨)
 - 입면 예: `CFG = dict(facing='S', scale='auto', page='남측 입면', pdf=r'D:\out\남측.pdf'); elevation(CFG); export_pdf(CFG)`
 - 모델 단위는 mm 기준

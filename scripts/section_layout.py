@@ -676,7 +676,7 @@ def _tb_place(page, cfg, scale):
 SYM = dict(font_ko='Malgun Gothic', font_en='Arial', w=0.18, w_thin=0.09,
            tag_h=1.8, tag_h2=1.4, tag_pad=0.8,                 # 실명 태그: 실명 / 실번호 | F.L
            bub_r=3.2, bub_h=2.2, bub_gap=6.0,                  # 그리드 버블: 반지름·글자·건물에서 떨어진 거리
-           lvl_h=1.8, lvl_len=14.0, lvl_tri=1.6,               # 층 레벨: 글자·가로선 길이·삼각형 크기
+           lvl_h=1.8, lvl_len=14.0, lvl_tri=1.6, dim_h=1.6, dim_gap=5.0, tick=0.9, w_tick=0.25,               # 층 레벨: 글자·가로선 길이·삼각형 크기
            north_r=6.0, cut_r=4.0, cut_h=2.6)                  # 방위표, 단면 절단 표시
 
 def _json(v):
@@ -684,6 +684,30 @@ def _json(v):
         import json, io
         return json.loads(io.open(v, encoding='utf-8').read())
     return v
+
+def grid_from_layer(layer, z=None, ztol=500.0):
+    """모델 안 그리드 기호(CAD 축선 레이어 등)에서 그리드 좌표를 읽음 → CFG['grid'] 에 바로 넣음.
+    글자 'X3'·'Y1' 은 첫 글자 축, 숫자만('3') → X, 영문만('B') → Y. 글자 원점 2 m 안에 블록(버블) 삽입점이 있으면 그 점이 그리드 위.
+    z = 그 높이 근처 기호만 (층별로 다를 때). 축과 나란한 그리드만 (회전 그리드 X)"""
+    mm = Rhino.RhinoMath.UnitScale(Rhino.UnitSystem.Millimeters, d.ModelUnitSystem)
+    idx = set(l.Index for l in d.Layers if l.FullPath and (l.FullPath == layer or l.FullPath.startswith(layer + '::')))
+    es = Rhino.DocObjects.ObjectEnumeratorSettings(); es.HiddenObjects = True; es.LockedObjects = True; es.VisibleFilter = False
+    txt, ins = [], []
+    for o in d.Objects.GetObjectList(es):
+        if o.Attributes.LayerIndex not in idx: continue
+        g = o.Geometry
+        if isinstance(g, Rhino.Geometry.TextEntity): txt.append((g.PlainText.strip(), g.Plane.Origin))
+        elif isinstance(g, Rhino.Geometry.InstanceReferenceGeometry): ins.append(g.Xform * Point3d(0, 0, 0))
+    out = {'X': {}, 'Y': {}}
+    for t, p in txt:
+        if z is not None and abs(p.Z - z) > ztol * mm: continue
+        m = re.match(r'^([XxYy])\s*-?\s*\d+[A-Za-z]?$', t)
+        k = m.group(1).upper() if m else ('X' if re.match(r'^\d+[A-Za-z]?$', t) else ('Y' if re.match(r'^[A-Za-z]{1,2}\d*$', t) else None))
+        if k is None or t in out[k]: continue
+        q = min(ins, key=lambda c: c.DistanceTo(p)) if ins else None
+        if q is not None and q.DistanceTo(p) < 2000 * mm: p = q
+        out[k][t] = round(p.X if k == 'X' else p.Y, 1)
+    return out
 
 def _symbols(cfg, page, det, ls, scale, bbm):
     """도면 기호를 페이지 공간에. 평면: 실명 태그(CFG['rooms']+rooms_level)·그리드(CFG['grid'])·방위표(CFG['north'] 도)·
@@ -723,23 +747,53 @@ def _symbols(cfg, page, det, ls, scale, bbm):
         d.Objects.AddCurve(Rhino.Geometry.Circle(c, SYM['bub_r']).ToNurbsCurve(), att(z=201)); text(lab, c, SYM['bub_h'])
         return c
     grid = cfg.get('grid')
+    mm = Rhino.RhinoMath.UnitScale(Rhino.UnitSystem.Millimeters, d.ModelUnitSystem)
+    def dims(vals, side, base):                        # 치수선 (현황도면식): 그리드 사이 + 전체. side 'top' = 그림 위, 'left' = 왼쪽. 바깥 끝 좌표 돌려줌
+        vals = sorted(vals)
+        if len(vals) < 2 or not cfg.get('grid_dims', True): return base
+        s_ = 1 if side == 'top' else -1; e = base
+        def pt(a, b): return Point3d(a, b, 0) if side == 'top' else Point3d(b, a, 0)
+        for row in [vals] + ([[vals[0], vals[-1]]] if len(vals) > 2 else []):
+            e = e + s_ * SYM['dim_gap']
+            d.Objects.AddLine(pt(row[0][0] - 1.2, e), pt(row[-1][0] + 1.2, e), att(w=SYM['w_thin'], z=150))
+            for a, _ in row:
+                t = SYM['tick']; d.Objects.AddLine(pt(a - t, e - s_ * t), pt(a + t, e + s_ * t), att(w=SYM['w_tick'], z=151))
+            for (a0, v0), (a1, v1) in zip(row, row[1:]):
+                lab = '{:,}'.format(int(round(abs(v1 - v0) / mm))); h = SYM['dim_h']
+                up = 0.5 if abs(a1 - a0) > width(lab, h) + 0.8 else 0.5 + h + 0.4   # 좁으면 한 줄 더 밖
+                te = Rhino.Geometry.TextEntity(); te.PlainText = lab; te.TextHeight = h; te.Font = Rhino.DocObjects.Font(SYM['font_en'])
+                te.Plane = Plane(pt((a0 + a1) / 2, e + s_ * up), Vector3d.XAxis, Vector3d.YAxis) if side == 'top' else                            Plane(pt((a0 + a1) / 2, e + s_ * up), Vector3d.YAxis, -Vector3d.XAxis)   # 왼쪽은 세워 씀
+                te.TextHorizontalAlignment = H.Center; te.TextVerticalAlignment = Vt.Bottom
+                d.Objects.AddText(te, att(z=202))
+        return e
     if grid:
         g = _json(grid); g = g.get(cfg.get('rooms_level'), g) if isinstance(g, dict) and 'X' not in g else g
-        gap = SYM['bub_gap'] + SYM['bub_r']
-        if ax == 'z':                                  # 평면: X 는 위·아래, Y 는 왼쪽·오른쪽 + 가는 일점쇄선
-            U, D_, L_, R_ = Vector3d(0, 1, 0), Vector3d(0, -1, 0), Vector3d(-1, 0, 0), Vector3d(1, 0, 0)
-            for lab, x in sorted(g.get('X', {}).items(), key=lambda kv: float(kv[1])):
-                q = P(float(x), 0); a1 = bubble(Point3d(q.X, py1 + gap, 0), lab, U); a0 = bubble(Point3d(q.X, py0 - gap, 0), lab, D_)
-                d.Objects.AddLine(Point3d(q.X, a0.Y + SYM['bub_r'], 0), Point3d(q.X, a1.Y - SYM['bub_r'], 0), att(w=SYM['w_thin'], z=150, dash=True)); n += 1
-            for lab, y in sorted(g.get('Y', {}).items(), key=lambda kv: float(kv[1])):
-                q = P(0, float(y)); a0 = bubble(Point3d(px0 - gap, q.Y, 0), lab, L_); a1 = bubble(Point3d(px1 + gap, q.Y, 0), lab, R_)
-                d.Objects.AddLine(Point3d(a0.X + SYM['bub_r'], q.Y, 0), Point3d(a1.X - SYM['bub_r'], q.Y, 0), att(w=SYM['w_thin'], z=150, dash=True)); n += 1
-        else:                                          # 단면·입면: 보이는 쪽 축의 그리드만 아래에
-            key = 'Y' if ax == 'x' else 'X'
+        gap = SYM['bub_gap'] + SYM['bub_r']; R_ = SYM['bub_r']
+        def inside(v, j): return bbm.Min[j] - 300 * mm <= v <= bbm.Max[j] + 300 * mm   # 그림 밖 그리드는 버림
+        if ax == 'z':                                  # 평면: X 는 위(치수선 바깥)·아래, Y 는 왼쪽(치수선 바깥)·오른쪽 + 가는 일점쇄선
+            U, D_, L_, R_v = Vector3d(0, 1, 0), Vector3d(0, -1, 0), Vector3d(-1, 0, 0), Vector3d(1, 0, 0)
+            xs = sorted((P(float(x), 0).X, float(x), lab) for lab, x in g.get('X', {}).items() if inside(float(x), 0))
+            ys = sorted((P(0, float(y)).Y, float(y), lab) for lab, y in g.get('Y', {}).items() if inside(float(y), 1))
+            top = dims([(a, v) for a, v, _ in xs], 'top', py1); left = dims([(a, v) for a, v, _ in ys], 'left', px0)
+            for a, v, lab in xs:
+                a1 = bubble(Point3d(a, max(top + 4, py1 + gap - R_) + R_, 0), lab, U); a0 = bubble(Point3d(a, py0 - gap, 0), lab, D_)
+                d.Objects.AddLine(Point3d(a, a0.Y + R_, 0), Point3d(a, a1.Y - R_, 0), att(w=SYM['w_thin'], z=150, dash=True)); n += 1
+            for a, v, lab in ys:
+                a0 = bubble(Point3d(min(left - 4, px0 - gap + R_) - R_, a, 0), lab, L_); a1 = bubble(Point3d(px1 + gap, a, 0), lab, R_v)
+                d.Objects.AddLine(Point3d(a0.X + R_, a, 0), Point3d(a1.X - R_, a, 0), att(w=SYM['w_thin'], z=150, dash=True)); n += 1
+        else:                                          # 단면·입면: 잘린 벽·기둥을 지나는 그리드만, 버블은 위 + 치수선
+            key = 'Y' if ax == 'x' else 'X'; j = 1 if key == 'Y' else 0
+            pick = cfg.get('grid_pick', 'all' if cfg.get('elev') else 'cut')   # 'cut' | 'all' | ['Y1', ...]
+            items = []
             for lab, v in g.get(key, {}).items():
-                q = P(0, float(v), bbm.Min.Z) if key == 'Y' else P(float(v), 0, bbm.Min.Z)
-                b0 = bubble(Point3d(q.X, py0 - gap, 0), lab, Vector3d(0, -1, 0))
-                d.Objects.AddLine(Point3d(q.X, b0.Y + SYM['bub_r'], 0), Point3d(q.X, py1 + 3, 0), att(w=SYM['w_thin'], z=150, dash=True)); n += 1
+                v = float(v)
+                if not inside(v, j) or (isinstance(pick, (list, tuple)) and lab not in pick): continue
+                if pick == 'cut' and sum(h for lo, hi, h in cfg.get('_walls', []) if lo - 50 * mm <= v <= hi + 50 * mm) < 1500 * mm: continue
+                q = P(0, v, bbm.Min.Z) if key == 'Y' else P(v, 0, bbm.Min.Z); items.append((q.X, v, lab))
+            items.sort(); top = dims([(a, v) for a, v, _ in items], 'top', py1)
+            for a, v, lab in items:
+                b = bubble(Point3d(a, top + 4 + R_, 0), lab, Vector3d(0, 1, 0))
+                d.Objects.AddLine(Point3d(a, b.Y - R_, 0), Point3d(a, py0 - 2, 0), att(w=SYM['w_thin'], z=150, dash=True)); n += 1
     if ax == 'z':
         rooms = cfg.get('rooms')
         if rooms:                                      # 실명 태그: 위 칸 실명, 아래 칸 실번호 | F.L (흰 바탕)
@@ -765,7 +819,7 @@ def _symbols(cfg, page, det, ls, scale, bbm):
                 d.Objects.AddLine(tip, c - v * R * 0.35 + nv * (R * 0.45 * sgn), att())
                 d.Objects.AddLine(c - v * R * 0.35 + nv * (R * 0.45 * sgn), tail, att())
             text('N', c + v * (R + 2.6), 2.8); n += 1
-        off = (SYM['bub_gap'] + 4 * SYM['bub_r'] + 8) if grid else 14   # 그리드 버블 줄 바깥
+        off = max([max(c.Y - py1, py0 - c.Y, px0 - c.X, c.X - px1) for c in placed] + [0]) + SYM['bub_r'] + 6 if placed else 14   # 그리드 버블 줄 바깥
         for ct in cfg.get('cuts', []):                # 단면 절단 표시: 건물 밖 양끝 동그라미 + 보는 방향 화살 + 이름
             R = SYM['cut_r']; lab = ct.get('name', 'A'); lk = ct.get('look', -1)
             if ct.get('axis', 'x') == 'x':
@@ -821,9 +875,14 @@ def build(cfg):
     bb = BoundingBox.Empty
     if cfg.get('_bb') is not None: bb = cfg['_bb']             # 입면: 건물 전체 범위
     else:
+        hj = {'x': 1, 'y': 0}.get(ax); mm = Rhino.RhinoMath.UnitScale(Rhino.UnitSystem.Millimeters, d.ModelUnitSystem); walls = []
         for k, cs in _cut(cfg, (lc, ls)).items():
             if k in ('EARTH', 'WHITE'): continue
-            for cv in cs: bb.Union(cv.GetBoundingBox(True))
+            for cv in cs:
+                b = cv.GetBoundingBox(True); bb.Union(b)
+                if hj is not None and k != 'STAIR' and b.Max[hj] - b.Min[hj] <= 1500 * mm:   # 벽·기둥 조각 (가로 폭 좁은 것): 단면 그리드 고르기용
+                    walls.append((b.Min[hj], b.Max[hj], b.Max.Z - b.Min.Z))
+        cfg['_walls'] = walls
     tgt = bb.Center
     if not cfg.get('elev'): tgt = Point3d(*[c if j == i_ else tgt[j] for j in range(3)])   # 입면은 건물 중심을 봄 (단면판에 두면 먼 쪽이 시야 밖)
     u_, v_ = {'x': (1, 2), 'y': (0, 2), 'z': (0, 1)}[ax]   # 종이 가로·세로가 되는 모델 축
