@@ -361,10 +361,15 @@ def _stair_marks(cfg, xf, ls, pid, scale, skip):
             for sgn in (1, -1):                               # 화살촉
                 r = Transform.Rotation(math.radians(25 * sgn), Vector3d.ZAxis, pp2[-1])
                 h = pp2[-1] - v * S['head']; h.Transform(r); d.Objects.AddLine(pp2[-1], h, att(K, S['w']))
-            if lab:
-                v0 = pp2[1] - pp2[0]; v0.Unitize()
+            if lab:                                           # 글자: 시작 동그라미 바로 뒤(화살표 반대쪽), 글자 가운데를 화살표 선에 맞춤
+                v0 = pp2[1] - pp2[0]; v0.Unitize(); bk = -v0
                 te = Rhino.Geometry.TextEntity(); te.PlainText = lab; te.TextHeight = S['text_h']
-                te.Plane = Plane(pp2[0] - v0 * (S['text_h'] * 1.6) - Vector3d(S['text_h'] * 0.8, S['text_h'] * 0.5, 0), Vector3d.ZAxis)
+                te.Plane = Plane(pp2[0] + bk * (S['dot'] + S['text_h'] * 0.35), Vector3d.ZAxis)
+                H, Vt = Rhino.DocObjects.TextHorizontalAlignment, Rhino.DocObjects.TextVerticalAlignment
+                if abs(bk.X) >= abs(bk.Y):                    # 화살표가 가로: 글자를 좌우로 붙이고 세로 가운데
+                    te.TextHorizontalAlignment = H.Left if bk.X > 0 else H.Right; te.TextVerticalAlignment = Vt.Middle
+                else:                                         # 세로: 위아래로 붙이고 가로 가운데
+                    te.TextHorizontalAlignment = H.Center; te.TextVerticalAlignment = Vt.Bottom if bk.Y > 0 else Vt.Top
                 d.Objects.AddText(te, att(K, S['w']))
     return (n_up, n_dn)
 
@@ -684,8 +689,9 @@ def export_pdf(cfg, dpi=300):
             plot_style()                                          # 출력색은 쓰는 동안만 → 문서는 늘 저장 가능 상태
             pg = [v for v in d.Views.GetPageViews() if v.PageName == cfg['page']][0]
             f = Rhino.FileIO.FilePdf.Create()
-            s = Rhino.Display.ViewCaptureSettings(pg, dpi)
-            s.RasterMode = False                                  # 벡터 (흰 가림 해치가 Technical 선을 가려 줌)
+            raster = cfg.get('raster', bool(cfg.get('elev')))     # 입면은 래스터: 벡터 PDF 는 Technical 숨은선을 안 가림(겪음). 화면 표시 그대로
+            s = Rhino.Display.ViewCaptureSettings(pg, cfg.get('dpi', 400 if raster else dpi))
+            s.RasterMode = raster                                 # 단면·평면 = 벡터 (흰 가림 해치가 Technical 선을 가려 줌)
             s.OutputColor = Rhino.Display.ViewCaptureSettings.ColorMode.PrintColor   # BlackAndWhite 는 흰 가림을 검게 만듦
             s.UsePrintWidths = True; s.DefaultPrintWidthMillimeters = STYLE['beyond_w']
             f.AddPage(s); f.Write(pdf_path)
