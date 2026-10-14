@@ -18,7 +18,24 @@ Rhino 8 모델을 잘라 **A3 레이아웃 단면도·평면도 PDF**를 자동�
   없으면 간이 패턴으로 대신함. 다른 `.pat` 은 스크립트의 `PAT_EXTRA` 에 경로 추가.
   (Autodesk 해치 파일은 이 패키지에 들어 있지 않음)
 
-## 설치
+## 공유용 프롬프트 (Claude Code 에 그대로 붙여 넣기)
+```
+Rhino 단면도·평면도 자동화 스킬을 설치하고 내 모델로 시험해 줘.
+
+1. 설치: https://github.com/khjjude030609-beep/rhino-section-layout 을
+   C:\Users\<내 이름>\.claude\skills\rhino-section-layout 에 받아 줘 (Windows 기준).
+   받은 뒤 SKILL.md 와 README.md 를 먼저 읽어.
+2. 확인: Rhino 8 이 열려 있고 Rhino MCP 로 Python(run_python 같은 도구)을 돌릴 수 있는지 확인해.
+   안 되면 무엇이 빠졌는지만 알려 주고 멈춰. 모델 단위가 mm 인지도 봐.
+3. 재질 맞추기: 시험 단면에 걸리는 레이어 목록과 스킬이 판정한 재질(kind)을 표로 보여 줘.
+   틀린 줄이 있으면 MAT / PART / VOID / STAIR 낱말 표를 어떻게 고칠지 제안하고, 내가 확인한 뒤에 고쳐.
+   벽돌 치수(BRICK, BRICK_W)도 내 모델 기준으로 물어봐.
+4. 시험 출력: 모델 범위를 보고 단면 1장(건물 가운데를 가로지르게)과 평면 1장(바닥 위 1.2 m)을 제안해.
+   내가 위치를 정하면 A3 PDF 로 뽑고 PNG 로 보여 줘. 축척은 자동.
+5. 내 Rhino 파일은 내가 말하기 전에는 저장하지 마.
+```
+
+## 설치 (직접)
 1. `rhino-section-layout` 폴더를 통째로 `C:\Users\<사용자>\.claude\skills\` 안에 복사
 2. Claude Code 를 다시 열면 스킬 목록에 보임
 3. Rhino 에 모델을 열고 Claude 에게: "x = 121 m 에서 남북 단면도 찍어줘", "1층 평면도 뽑아줘 (z = 1.2 m)"
