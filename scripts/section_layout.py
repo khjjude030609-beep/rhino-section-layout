@@ -621,6 +621,180 @@ def clear_layer(path):
         for ob in list(d.Objects.FindByLayer(d.Layers[i])):
             if ob.ObjectType != Rhino.DocObjects.ObjectType.ClipPlane: d.Objects.Delete(ob, True)
 
+# ---- 도각 (CFG['titleblock'] = DWG 경로) ----
+# 도각 DWG 를 명령줄 -Import 로 한 번 들여와(대화상자 없음 — 대화상자가 뜨면 MCP 가 300초 멈춤, 겪음) 고정 부분은 블록,
+# 칸 글자(아래 TB_FIELDS 의 원래 첫 줄과 같은 글자)는 페이지마다 새 글자로. 값 = CFG['tb'] dict + title·scale·bar1·bar2
+TB_PAPER = (420.0, 297.0)
+TB_AREA = (8.0, 33.0, 412.0, 289.0)                     # 그림 칸 = 도각 안쪽 틀 (홍익대 A3 도각 기준, 다른 도각이면 CFG['tb_area'])
+TB_FIELDS = {'scale 1:100 @A3': 'scale 1:{scale} @A3',   # 원래 글자 첫 줄 → 새 글자 ({…} = 값)
+             'Digital Design 2020 Spring': '{project}\n{author}\n{title}',
+             'xxx xxx xxxxx': '{phone}', 'xxxx@hongik.ac.kr': '{email}',
+             '5.00m': '{bar1}', '10.0m': '{bar2}'}
+LYR_TB = TAG + '::도각'
+
+def _tb_template(dwg, fields_map):
+    name = '도각_' + os.path.splitext(os.path.basename(dwg))[0]
+    cache = sc.sticky.setdefault('secl_tb', {})
+    idef = d.InstanceDefinitions.Find(name)
+    if idef is not None and name in cache: return idef.Index, cache[name]
+    _model_view()                                        # 페이지가 활성이면 페이지 공간으로 들어감
+    before = set(o.Id for o in d.Objects); nl = d.Layers.Count
+    Rhino.RhinoApp.RunScript('_-Import "%s" _Enter _Enter' % dwg, False)
+    new = [o for o in d.Objects if o.Id not in before]
+    lt = _layer(LYR_TB); font = Rhino.DocObjects.Font('Arial')
+    geoms, attrs, fields = [], [], []
+    for o in new:
+        g = o.Geometry.Duplicate()
+        if isinstance(g, Rhino.Geometry.TextEntity):
+            g.Font = font
+            if g.PlainText.splitlines()[0].strip() in fields_map: fields.append(g); continue
+        a = Rhino.DocObjects.ObjectAttributes(); a.LayerIndex = lt
+        geoms.append(g); attrs.append(a)
+    if idef is None: d.InstanceDefinitions.Add(name, '도각 (rhino-section-layout)', Point3d.Origin, geoms, attrs)
+    for o in new: d.Objects.Delete(o, True)
+    for i in range(d.Layers.Count - 1, nl - 1, -1):     # DWG 에서 따라 들어온 빈 레이어 정리
+        if not d.Layers[i].IsDeleted and not (d.Objects.FindByLayer(d.Layers[i]) or []): d.Layers.Delete(i, True)
+    cache[name] = fields
+    return d.InstanceDefinitions.Find(name).Index, fields
+
+def _tb_place(page, cfg, scale):
+    fm = dict(TB_FIELDS); fm.update(cfg.get('tb_fields', {}))
+    idx, fields = _tb_template(cfg['titleblock'], fm)
+    pid = page.MainViewport.Id
+    a = Rhino.DocObjects.ObjectAttributes(); a.Space = Rhino.DocObjects.ActiveSpace.PageSpace; a.ViewportId = pid; a.LayerIndex = _layer(LYR_TB)
+    d.Objects.AddInstanceObject(idx, Transform.Identity, a)
+    v = dict(project='', author='', phone='', email='', date=time.strftime('%Y-%m-%d'))
+    v.update(cfg.get('tb', {}))
+    v.update(title=(cfg.get('title') or [cfg['page']])[0].replace('{scale}', '%d' % scale), scale='%d' % scale,
+             bar1='%.2fm' % (5 * scale / 100.0), bar2='%.1fm' % (10 * scale / 100.0))
+    for f in fields:
+        te = f.Duplicate(); key = te.PlainText.splitlines()[0].strip()
+        te.PlainText = fm[key].format(**v).replace('\n', '\r\n')
+        d.Objects.AddText(te, a)
+
+# ---- 도면 기호 (현황도면 스타일) — 크기는 종이 mm ----
+SYM = dict(font_ko='Malgun Gothic', font_en='Arial', w=0.18, w_thin=0.09,
+           tag_h=1.8, tag_h2=1.4, tag_pad=0.8,                 # 실명 태그: 실명 / 실번호 | F.L
+           bub_r=3.2, bub_h=2.2, bub_gap=6.0,                  # 그리드 버블: 반지름·글자·건물에서 떨어진 거리
+           lvl_h=1.8, lvl_len=14.0, lvl_tri=1.6,               # 층 레벨: 글자·가로선 길이·삼각형 크기
+           north_r=6.0, cut_r=4.0, cut_h=2.6)                  # 방위표, 단면 절단 표시
+
+def _json(v):
+    if isinstance(v, str):
+        import json, io
+        return json.loads(io.open(v, encoding='utf-8').read())
+    return v
+
+def _symbols(cfg, page, det, ls, scale, bbm):
+    """도면 기호를 페이지 공간에. 평면: 실명 태그(CFG['rooms']+rooms_level)·그리드(CFG['grid'])·방위표(CFG['north'] 도)·
+    단면 절단 표시(CFG['cuts']). 단면·입면: 그리드·층 레벨(CFG['levels'] = [(이름, z)])"""
+    xf = Transform.PlanarProjection(Plane.WorldXY) * det.WorldToPageTransform
+    pid = page.MainViewport.Id; K = System.Drawing.Color.Black; Wt = System.Drawing.Color.White
+    solid = d.HatchPatterns.Find('SOLID', True)
+    lt_cen = next((d.Linetypes.Find(nm) for nm in ('DashDot', 'Center', 'Dashed') if d.Linetypes.Find(nm) >= 0), -1)
+    def att(col=K, w=SYM['w'], z=200, dash=False):
+        a = Rhino.DocObjects.ObjectAttributes(); a.LayerIndex = ls; a.Space = Rhino.DocObjects.ActiveSpace.PageSpace; a.ViewportId = pid
+        if dash and lt_cen >= 0:
+            a.LinetypeSource = Rhino.DocObjects.ObjectLinetypeSource.LinetypeFromObject; a.LinetypeIndex = lt_cen
+        a.DisplayOrder = z; a.ColorSource = Rhino.DocObjects.ObjectColorSource.ColorFromObject; a.ObjectColor = col
+        a.PlotColorSource = Rhino.DocObjects.ObjectPlotColorSource.PlotColorFromObject; a.PlotColor = col
+        a.PlotWeightSource = Rhino.DocObjects.ObjectPlotWeightSource.PlotWeightFromObject; a.PlotWeight = w; return a
+    H, Vt = Rhino.DocObjects.TextHorizontalAlignment, Rhino.DocObjects.TextVerticalAlignment
+    def text(s, p, h, hal=H.Center, val=Vt.Middle, z=202):
+        te = Rhino.Geometry.TextEntity(); te.PlainText = s; te.TextHeight = h
+        te.Font = Rhino.DocObjects.Font(SYM['font_ko'] if any(ord(ch) > 0x3000 for ch in s) else SYM['font_en'])
+        te.Plane = Plane(p, Vector3d.ZAxis); te.TextHorizontalAlignment = hal; te.TextVerticalAlignment = val
+        d.Objects.AddText(te, att(z=z)); return te
+    def width(s, h): return sum((1.0 if ord(ch) > 0x3000 else 0.6) for ch in s) * h
+    def mask(pts, z=199):
+        pl = Rhino.Geometry.PolylineCurve(pts + [pts[0]])
+        for hh in Rhino.Geometry.Hatch.Create([pl], solid, 0.0, 1.0, 0.001) or []: d.Objects.AddHatch(hh, att(Wt, 0, z))
+        d.Objects.AddCurve(pl, att(z=z + 1))
+    def P(x, y, z=0): return xf * Point3d(x, y, z)
+    lo, hi = xf * bbm.Min, xf * bbm.Max
+    px0, px1, py0, py1 = min(lo.X, hi.X), max(lo.X, hi.X), min(lo.Y, hi.Y), max(lo.Y, hi.Y)
+    ax = cfg.get('axis', 'x'); n = 0
+    placed = []
+    def bubble(c, lab, out):                           # out = 건물 바깥쪽 방향. 가까운 버블과 겹치면 한 칸 더 밖으로
+        k = 0
+        while any(c.DistanceTo(q) < 2 * SYM['bub_r'] + 0.3 for q in placed) and k < 3:
+            c = c + out * (2 * SYM['bub_r'] + 0.6); k += 1
+        placed.append(c)
+        d.Objects.AddCurve(Rhino.Geometry.Circle(c, SYM['bub_r']).ToNurbsCurve(), att(z=201)); text(lab, c, SYM['bub_h'])
+        return c
+    grid = cfg.get('grid')
+    if grid:
+        g = _json(grid); g = g.get(cfg.get('rooms_level'), g) if isinstance(g, dict) and 'X' not in g else g
+        gap = SYM['bub_gap'] + SYM['bub_r']
+        if ax == 'z':                                  # 평면: X 는 위·아래, Y 는 왼쪽·오른쪽 + 가는 일점쇄선
+            U, D_, L_, R_ = Vector3d(0, 1, 0), Vector3d(0, -1, 0), Vector3d(-1, 0, 0), Vector3d(1, 0, 0)
+            for lab, x in sorted(g.get('X', {}).items(), key=lambda kv: float(kv[1])):
+                q = P(float(x), 0); a1 = bubble(Point3d(q.X, py1 + gap, 0), lab, U); a0 = bubble(Point3d(q.X, py0 - gap, 0), lab, D_)
+                d.Objects.AddLine(Point3d(q.X, a0.Y + SYM['bub_r'], 0), Point3d(q.X, a1.Y - SYM['bub_r'], 0), att(w=SYM['w_thin'], z=150, dash=True)); n += 1
+            for lab, y in sorted(g.get('Y', {}).items(), key=lambda kv: float(kv[1])):
+                q = P(0, float(y)); a0 = bubble(Point3d(px0 - gap, q.Y, 0), lab, L_); a1 = bubble(Point3d(px1 + gap, q.Y, 0), lab, R_)
+                d.Objects.AddLine(Point3d(a0.X + SYM['bub_r'], q.Y, 0), Point3d(a1.X - SYM['bub_r'], q.Y, 0), att(w=SYM['w_thin'], z=150, dash=True)); n += 1
+        else:                                          # 단면·입면: 보이는 쪽 축의 그리드만 아래에
+            key = 'Y' if ax == 'x' else 'X'
+            for lab, v in g.get(key, {}).items():
+                q = P(0, float(v), bbm.Min.Z) if key == 'Y' else P(float(v), 0, bbm.Min.Z)
+                b0 = bubble(Point3d(q.X, py0 - gap, 0), lab, Vector3d(0, -1, 0))
+                d.Objects.AddLine(Point3d(q.X, b0.Y + SYM['bub_r'], 0), Point3d(q.X, py1 + 3, 0), att(w=SYM['w_thin'], z=150, dash=True)); n += 1
+    if ax == 'z':
+        rooms = cfg.get('rooms')
+        if rooms:                                      # 실명 태그: 위 칸 실명, 아래 칸 실번호 | F.L (흰 바탕)
+            for r in _json(rooms):
+                if cfg.get('rooms_level') and r.get('level') != cfg['rooms_level']: continue
+                c = P(r['x'], r['y']); h1, h2, pd = SYM['tag_h'], SYM['tag_h2'], SYM['tag_pad']
+                w1, wn, wf = width(r['name'], h1), width(r['no'], h2), width(r['fl'], h2)
+                Wd = max(w1, wn + wf + 3 * pd) + 2 * pd; Hh = h1 + h2 + 4 * pd
+                x0, x1, y0, y1 = c.X - Wd / 2, c.X + Wd / 2, c.Y - Hh / 2, c.Y + Hh / 2; ym = y0 + h2 + 2 * pd
+                mask([Point3d(x0, y0, 0), Point3d(x1, y0, 0), Point3d(x1, y1, 0), Point3d(x0, y1, 0)])
+                d.Objects.AddLine(Point3d(x0, ym, 0), Point3d(x1, ym, 0), att(z=201))
+                xs = x0 + 2 * pd + wn
+                d.Objects.AddLine(Point3d(xs, y0, 0), Point3d(xs, ym, 0), att(z=201))
+                text(r['name'], Point3d(c.X, (ym + y1) / 2, 0), h1)
+                text(r['no'], Point3d((x0 + xs) / 2, (y0 + ym) / 2, 0), h2)
+                text(r['fl'], Point3d((xs + x1) / 2, (y0 + ym) / 2, 0), h2); n += 1
+        if cfg.get('north') is not None:              # 방위표: 그림 칸 오른쪽 위
+            ar = cfg['_area']; R = SYM['north_r']; c = Point3d(ar[2] - R - 6, ar[3] - R - 6, 0)
+            a = math.radians(float(cfg['north'])); v = Vector3d(-math.sin(a), math.cos(a), 0); nv = Vector3d(-v.Y, v.X, 0)
+            d.Objects.AddCurve(Rhino.Geometry.Circle(c, R).ToNurbsCurve(), att())
+            tip, tail = c + v * R, c - v * R * 0.7
+            for sgn in (1, -1):
+                d.Objects.AddLine(tip, c - v * R * 0.35 + nv * (R * 0.45 * sgn), att())
+                d.Objects.AddLine(c - v * R * 0.35 + nv * (R * 0.45 * sgn), tail, att())
+            text('N', c + v * (R + 2.6), 2.8); n += 1
+        off = (SYM['bub_gap'] + 4 * SYM['bub_r'] + 8) if grid else 14   # 그리드 버블 줄 바깥
+        for ct in cfg.get('cuts', []):                # 단면 절단 표시: 건물 밖 양끝 동그라미 + 보는 방향 화살 + 이름
+            R = SYM['cut_r']; lab = ct.get('name', 'A'); lk = ct.get('look', -1)
+            if ct.get('axis', 'x') == 'x':
+                q = P(float(ct['at']), 0); e = [Point3d(q.X, py0 - off, 0), Point3d(q.X, py1 + off, 0)]; dv = Vector3d(lk, 0, 0)
+            else:
+                q = P(0, float(ct['at'])); e = [Point3d(px0 - off, q.Y, 0), Point3d(px1 + off, q.Y, 0)]; dv = Vector3d(0, lk, 0)
+            for i, c in enumerate(e):
+                d.Objects.AddCurve(Rhino.Geometry.Circle(c, R).ToNurbsCurve(), att(w=0.25))
+                inward = e[1 - i] - c; inward.Unitize()
+                d.Objects.AddLine(c + inward * R, c + inward * (R + 6), att(w=0.35))
+                tri = [c + dv * (R + 2.5) + inward * 0.0, c + dv * R + inward * 1.2, c + dv * R - inward * 1.2]
+                mask([Point3d(t.X, t.Y, 0) for t in tri], z=203)
+                text(lab + ("'" if i else ''), c, SYM['cut_h'])
+            n += 1
+    else:
+        lv = cfg.get('levels')
+        if lv:                                         # 층 레벨: 그림 왼쪽 밖에 가로선 + ▽ + '이름' (현황도면: 2F F.L (G.L+4,475))
+            for name, z in lv:
+                q = P(bbm.Center.X, bbm.Center.Y, float(z)); y = q.Y; x1 = px0 - 4
+                x0 = x1 - max(SYM['lvl_len'], width(name, SYM['lvl_h']) + 3 + 2 * SYM['lvl_tri'] + 2)   # 글자가 벽에 안 닿게
+                d.Objects.AddLine(Point3d(x0, y, 0), Point3d(x1, y, 0), att(w=SYM['w_thin'], z=150))   # 왼쪽 짧은 선만
+                t = SYM['lvl_tri']
+                mask([Point3d(x0 + 3, y, 0), Point3d(x0 + 3 - t, y + 1.4 * t, 0), Point3d(x0 + 3 + t, y + 1.4 * t, 0)], z=203)
+                tx0 = x0 + 3 + t + 1; tw = width(name, SYM['lvl_h'])
+                pl = Rhino.Geometry.PolylineCurve([Point3d(tx0 - 0.3, y + 0.4, 0), Point3d(tx0 + tw + 0.3, y + 0.4, 0), Point3d(tx0 + tw + 0.3, y + 0.9 + SYM['lvl_h'] * 1.15, 0), Point3d(tx0 - 0.3, y + 0.9 + SYM['lvl_h'] * 1.15, 0), Point3d(tx0 - 0.3, y + 0.4, 0)])
+                for hh in Rhino.Geometry.Hatch.Create([pl], solid, 0.0, 1.0, 0.001) or []: d.Objects.AddHatch(hh, att(Wt, 0, 201))   # 글자 흰 바탕 (흙 해치 위)
+                text(name, Point3d(tx0, y + 0.8, 0), SYM['lvl_h'], H.Left, Vt.Bottom); n += 1
+    return n
+
 def build(cfg):
     st = sc.sticky.setdefault('secl_state', {'layers': {}, 'objs': {}, 'pages': []})
     _ensure_patterns(); dm = _mode(cfg.get('display')); mv = _model_view()
@@ -631,13 +805,18 @@ def build(cfg):
     lc = _layer(LYR_CLIP); ls = _layer(LYR_SEC)
     a = Rhino.DocObjects.ObjectAttributes(); a.LayerIndex = lc; a.Space = Rhino.DocObjects.ActiveSpace.ModelSpace
     # ---- 레이아웃 ----
-    W, H = cfg.get('paper', (420.0, 297.0))
+    tb = cfg.get('titleblock')
+    W, H = TB_PAPER if tb else cfg.get('paper', (420.0, 297.0))
     page = d.Views.AddPageView(cfg['page'], W, H); st['pages'].append(cfg['page'])
     proj = {('x', -1): Rhino.Display.DefinedViewportProjection.Right, ('x', 1): Rhino.Display.DefinedViewportProjection.Left,
             ('y', 1): Rhino.Display.DefinedViewportProjection.Front, ('y', -1): Rhino.Display.DefinedViewportProjection.Back,
             ('z', -1): Rhino.Display.DefinedViewportProjection.Top, ('z', 1): Rhino.Display.DefinedViewportProjection.Bottom}[(ax, look)]
-    side = cfg.get('side', 96.0)                          # 오른쪽 글 칸 폭 (도판 규칙: 글은 그림 밖)
-    det = page.AddDetailView('section', Point2d(12, 12), Point2d(W - side - 4, H - 12), proj)
+    side = cfg.get('side', 96.0)                          # 오른쪽 글 칸 폭 (도판 규칙: 글은 그림 밖) — 도각 모드에선 안 씀
+    if tb:
+        x0, y0, x1, y1 = cfg.get('tb_area', TB_AREA); AR = (x0 + 2, y0 + 2, x1 - 2, y1 - 2)   # 도각 안쪽 틀
+    else:
+        AR = (12.0, 12.0, W - side - 4, H - 12.0)
+    det = page.AddDetailView('section', Point2d(AR[0], AR[1]), Point2d(AR[2], AR[3]), proj)
     # 카메라 중심·축척: 실제로 잘린 단면 곡선 범위 (땅·흰 덩어리 빼고). 길게 뻗은 객체 하나에 끌려가지 않음
     bb = BoundingBox.Empty
     if cfg.get('_bb') is not None: bb = cfg['_bb']             # 입면: 건물 전체 범위
@@ -649,7 +828,7 @@ def build(cfg):
     if not cfg.get('elev'): tgt = Point3d(*[c if j == i_ else tgt[j] for j in range(3)])   # 입면은 건물 중심을 봄 (단면판에 두면 먼 쪽이 시야 밖)
     u_, v_ = {'x': (1, 2), 'y': (0, 2), 'z': (0, 1)}[ax]   # 종이 가로·세로가 되는 모델 축
     if scale == 'auto':                                   # 그림 칸에 90 % 로 들어가는 가장 큰 표준 축척
-        dw, dh = (W - side - 4 - 12) * 0.9, (H - 24) * 0.9
+        dw, dh = (AR[2] - AR[0]) * 0.9, (AR[3] - AR[1]) * 0.9
         mw = bb.Max[u_] - bb.Min[u_]; mh = bb.Max[v_] - bb.Min[v_]
         scale = next((s_ for s_ in SCALES if mw / s_ <= dw and mh / s_ <= dh), SCALES[-1])
         cfg['scale'] = scale; print('scale 1:%d' % scale)
@@ -668,6 +847,12 @@ def build(cfg):
     da = det.Attributes.Duplicate(); da.PlotWeightSource = Rhino.DocObjects.ObjectPlotWeightSource.PlotWeightFromObject; da.PlotWeight = -1
     d.Objects.ModifyAttributes(det, da, True)            # 디테일 테두리 출력 안 함
     stat = section(cfg, _layer(LYR_SEC + '::' + cfg['page']), (lc, ls))   # 페이지마다 하위 레이어
+    cfg['_area'] = AR
+    if any(cfg.get(k) for k in ('rooms', 'grid', 'levels', 'cuts')) or cfg.get('north') is not None:
+        stat['symbols'] = _symbols(cfg, page, det, _layer(LYR_SEC + '::' + cfg['page']), scale, bb)
+    if tb:                                                # 도각: 도면명·축척은 도각 띠에만 (그림 칸에 글자 없음)
+        _tb_place(page, cfg, scale); d.Views.Redraw()
+        print('section', stat, 'page', cfg['page']); return stat
     # ---- 제목 칸 (페이지 공간, 명시) ----
     pid = page.MainViewport.Id
     def pa():

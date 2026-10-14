@@ -9,6 +9,8 @@ Rhino 8 모델을 잘라 **A3 레이아웃 단면도·평면도 PDF**를 자동�
   아래층으로 내려가는 계단 디딤판 + UP/DN 화살표 (곡선계단도 디딤판 중심을 따라 휨)
 - 입면도: `elevation(dict(facing='S', ...))` — 건물 범위를 스스로 구해 그 면을 바깥에서 봄, 지반선 포함
 - Rhino 블록(인스턴스) 속 객체까지 자름
+- 도각: DWG 도각을 페이지 틀로 (칸 글자 자동 채움: 프로젝트·이름·도면명·축척·연락처, 축척 막대 숫자도 축척에 맞춤)
+- 도면 기호: 실명 태그(실명 / 실번호 | F.L), 그리드 버블 + 일점쇄선, 방위표, 평면의 단면 절단 표시, 단면·입면 층 레벨(▽)
 - 입면: `elevation(dict(facing='S', ...))` — 남·북·동·서 면, 지반선 포함, 재질 맵핑 없음
 - 자동 축척 (그림 칸에 맞는 가장 큰 표준 축척), 오른쪽 글 칸 (그림 칸에는 글자 없음)
 - CTB 없이 출력색 통일 (PDF 쓰는 동안만 적용 → 문서는 그대로 저장 가능)
@@ -56,6 +58,8 @@ export_pdf(CFG)   # 벡터 PDF, 결과는 PDF 옆 _export_log.txt
 - `axis`: `'x'`/`'y'` = 단면, `'z'` = 평면 · `cut`: 자를 좌표(mm) · `look`: -1 / +1 보는 방향 · `depth`: 뒤로 보이는 깊이(mm)
 - 평면 예: `dict(axis='z', cut=1200, look=-1, depth=1400, scale='auto', page='1층 평면', ...)` (바닥 위 1.2 m 에서 자르고 아래를 봄)
 - `stair_break=False` 면 평면 계단도 잘린 면으로 그림, `stair_marks=False` 면 UP/DN·아래층 계단 표시 끔, `floor` = 이 층 바닥 높이(기본 cut−1200)
+- 도각·기호 예: `titleblock=r'D:\도각.dwg', tb=dict(project='...', author='...', phone='...', email='...'), rooms='rooms.json', rooms_level='1F', grid='grid.json', north=0, cuts=[dict(name='A', axis='x', at=121000, look=-1)], levels=[('1F F.L', 0), ('2F F.L', 4065)]`
+  (도각 칸 맵 `TB_FIELDS` 는 예시 도각 기준이라, 다른 도각이면 `tb_fields={'원래 글자 첫 줄': '{title}'}` 처럼 바꿔 씀. 도각 DWG 는 포함 안 됨)
 - 입면 예: `CFG = dict(facing='S', scale='auto', page='남측 입면', pdf=r'D:\out\남측.pdf'); elevation(CFG); export_pdf(CFG)`
 - 모델 단위는 mm 기준
 

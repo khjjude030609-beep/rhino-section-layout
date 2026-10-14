@@ -1,6 +1,6 @@
 ---
 name: rhino-section-layout
-description: Rhino 8 모델을 잘라 레이아웃(A3) 단면도·평면도 PDF로 뽑는다 — Technical 표시, 재질별 실제 해치(벽돌 켜·철근콘크리트·흙·나뭇결·몰탈, AutoCAD/Revit .pat 원본), 블록 이음매 없는 합친 단면선, 두께별 선 굵기, 자동 축척, CTB 대신 출력색 통일, 오른쪽 글 칸. "단면도 찍어줘", "평면도 뽑아줘", "레이아웃으로 단면", "재질 해치 넣은 단면 PDF" 같은 요청에 쓴다. Rhino MCP(run_python) 필요.
+description: Rhino 8 모델을 잘라 레이아웃(A3) 단면도·평면도 PDF로 뽑는다 — Technical 표시, 재질별 실제 해치(벽돌 켜·철근콘크리트·흙·나뭇결·몰탈, AutoCAD/Revit .pat 원본), 블록 이음매 없는 합친 단면선, 두께별 선 굵기, 자동 축척, CTB 대신 출력색 통일, 오른쪽 글 칸 또는 DWG 도각, 실명 태그·그리드·방위표·단면 절단 표시·층 레벨 기호. "단면도 찍어줘", "평면도 뽑아줘", "레이아웃으로 단면", "재질 해치 넣은 단면 PDF" 같은 요청에 쓴다. Rhino MCP(run_python) 필요.
 ---
 
 # Rhino 단면·평면 레이아웃
@@ -26,6 +26,18 @@ export_pdf(CFG)            # Idle 핸들러로 출력 → CFG['pdf'] 옆 _export
 - `cut` 자를 좌표 mm, `look` -1 = 축 음의 방향을 봄 / +1 = 양의 방향, `depth` 뒤로 보이는 깊이 mm (0 = 제한 없음)
 - `scale` 숫자(1:N) 또는 `'auto'` = 잘린 범위가 그림 칸 90 % 에 들어가는 가장 큰 표준 축척 (`SCALES`). 제목의 `{scale}` 에 들어감
 - `paper` 기본 (420, 297), `side` 오른쪽 글 칸 폭 96 (글자는 전부 이 칸에, 그림 칸에는 글자 없음)
+- **도각** `titleblock`: 도각 DWG 경로. 주면 종이 = `TB_PAPER`(A3), 그림 칸 = 도각 안쪽 틀(`TB_AREA`, 다른 도각이면 `tb_area`),
+  오른쪽 글 칸 대신 도각 띠에 도면명·축척. DWG 는 명령줄 `_-Import` 로 한 번만 들여와 고정 부분은 블록 `도각_<파일이름>`,
+  칸 글자는 `TB_FIELDS`(원래 글자 첫 줄 → 새 글자, `{project} {author} {title} {scale} {phone} {email} {bar1} {bar2} {date}`)로 페이지마다 새로.
+  값 = `CFG['tb']` dict (개인 정보는 프로젝트 쪽 json 에 두고 스킬엔 넣지 말 것). 다른 도각이면 `tb_fields` 로 맵 덮어쓰기.
+  주의: `RhinoDoc.Import`(DWG) 는 가져오기 옵션 대화상자를 띄워 MCP 가 300초 멈춤(겪음) → 꼭 `RunScript('_-Import "..." _Enter _Enter')`
+- **도면 기호** (현황도면 스타일, `SYM` 크기 = 종이 mm):
+  - `rooms` = 목록(json 경로 또는 list, 항목 {level,no,name,fl,x,y}) + `rooms_level` → 평면에 실명 태그 '실명 / 실번호 | F.L' (흰 바탕)
+  - `grid` = {X:{이름:x}, Y:{이름:y}} 또는 층별 {'1F': {...}} → 평면은 네 변 버블 + 일점쇄선, 단면·입면은 보이는 축 버블(아래) + 위로 일점쇄선. 겹치는 버블은 밖으로 엇갈림
+  - `north` = 방위표 각도(도, +y 기준 반시계) → 그림 칸 오른쪽 위
+  - `cuts` = [{name, axis, at, look}] → 평면에 단면 절단 표시(양끝 동그라미·이름·보는 방향 삼각형), 그리드 버블 줄 바깥
+  - `levels` = [(이름, z)] → 단면·입면 왼쪽에 ▽ + 이름(예: '2F F.L (G.L+4,475)'), 글자 흰 바탕
+  - 실명·그리드 목록은 현황 DWG 글자에서 뽑아 만들 수 있음(accoreconsole + LISP 로 TEXT/MTEXT/INSERT 좌표 덤프 → 층 틀 오프셋은 그리드 기호를 맞대어 구함)
 - 해치만 다시: `clear_layer(LYR_SEC+'::'+CFG['page']); section(CFG)` (페이지가 이미 있을 때, 1~2초)
 - 출력색(회색 통일)은 `export_pdf` 가 쓰는 동안만 바꾸고 되돌림, 단면판은 그 디테일에만 걸림 → **문서는 언제든 저장해도 됨**
 - `export_pdf` 는 한 번에 하나만 (이전 로그가 생긴 뒤 다음 호출). 동시에 두 번 걸면 Idle 핸들러가 꼬임
