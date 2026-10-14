@@ -1,0 +1,51 @@
+# rhino-section-layout
+
+Rhino 8 모델을 잘라 **A3 레이아웃 단면도·평면도 PDF**를 자동으로 뽑는 Claude Code 스킬.
+(Claude Code skill that cuts a Rhino 8 model and exports A3 layout sections/plans with real material hatches.)
+
+- Technical 표시 + 재질별 실제 해치 (벽돌 켜 · 철근콘크리트 · 흙 · 나뭇결 · 몰탈 · 석재 · 단열)
+- 블록 이음매 없는 합친 단면선, 부재 두께에 따른 선 굵기 3단계, 작은 각재는 대각선 X
+- 자동 축척 (그림 칸에 맞는 가장 큰 표준 축척), 오른쪽 글 칸 (그림 칸에는 글자 없음)
+- CTB 없이 출력색 통일 (PDF 쓰는 동안만 적용 → 문서는 그대로 저장 가능)
+
+## 필요한 것
+- Windows + **Rhino 8** (Python 3 스크립트)
+- **Claude Code** + Python 을 Rhino 안에서 실행하는 **Rhino MCP 서버** (`run_python` 같은 도구)
+  - MCP 없이도 됨: Rhino `ScriptEditor` (Python 3) 에서 아래 "직접 쓰기"처럼 실행
+- (선택) AutoCAD 또는 Revit 설치 → 표준 해치 파일(`acadiso.pat`, `revit metric.pat`)을 자동으로 찾아 씀.
+  없으면 간이 패턴으로 대신함. 다른 `.pat` 은 스크립트의 `PAT_EXTRA` 에 경로 추가.
+  (Autodesk 해치 파일은 이 패키지에 들어 있지 않음)
+
+## 설치
+1. `rhino-section-layout` 폴더를 통째로 `C:\Users\<사용자>\.claude\skills\` 안에 복사
+2. Claude Code 를 다시 열면 스킬 목록에 보임
+3. Rhino 에 모델을 열고 Claude 에게: "x = 121 m 에서 남북 단면도 찍어줘", "1층 평면도 뽑아줘 (z = 1.2 m)"
+
+## 직접 쓰기 (ScriptEditor 또는 MCP)
+```python
+CFG = dict(axis='x', cut=121000, look=-1, depth=4000, scale='auto',
+           page='단면 A', pdf=r'D:\out\단면A.pdf',
+           title=['단면 A', 'x = 121.0 m', '축척 1:{scale} (A3)'])
+exec(open(r'C:\Users\<사용자>\.claude\skills\rhino-section-layout\scripts\section_layout.py', encoding='utf-8').read())
+remove_page(CFG['page'])
+build(CFG)        # 페이지 + 디테일 + 단면선·해치 + 제목 칸
+export_pdf(CFG)   # 벡터 PDF, 결과는 PDF 옆 _export_log.txt
+```
+- `axis`: `'x'`/`'y'` = 단면, `'z'` = 평면 · `cut`: 자를 좌표(mm) · `look`: -1 / +1 보는 방향 · `depth`: 뒤로 보이는 깊이(mm)
+- 모델 단위는 mm 기준
+
+## 내 모델에 맞추기 (중요)
+재질은 **레이어 이름 낱말**로 판정한다 (`scripts/section_layout.py` 의 `MAT`, `PART`, `VOID` 표).
+예: 레이어 이름에 '벽돌'·'brick' → 벽돌, '콘크리트'·'슬래브' → 철근콘크리트, '장선'·'timber' → 목재, '공간' → 그리지 않음.
+내 모델의 레이어 이름이 다르면 이 표에 낱말을 추가하면 된다. 그 밖에:
+- `BRICK = (230, 60, 10)`: 벽돌 길이·높이·줄눈 (mm)
+- `HATCH`, `HATCH_PLAN`: 재질별 패턴과 크기
+- `STYLE`: 선 굵기, 너머 보이는 선 회색
+
+## 한계
+- 재질을 이름으로 판정하므로 이름이 실제와 다르면 틀린 해치가 나옴
+- 닫힌 덩어리(solid)만 잘린 면으로 그림. 열린 면은 일반 선으로만 보임
+- 기와처럼 작은 객체가 수천 개 보이는 긴 단면은 PDF 출력에 1분 정도 걸림
+- 결과는 고정 그림: 모델·자르는 위치가 바뀌면 다시 실행 (한 장 몇 초)
+
+자세한 원리와 겪은 함정은 `SKILL.md` 참고.
