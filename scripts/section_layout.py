@@ -147,8 +147,11 @@ def _ensure_patterns():
             if orig in src: hp = src[orig]; hp.Name = name; d.HatchPatterns.Add(hp)
             else: _pattern(name, FALLBACK[name])
 
-def _mode():
+def _mode(name=None):
     modes = {m.EnglishName: m for m in Rhino.Display.DisplayModeDescription.GetDisplayModes()}
+    if name:                                              # CFG['display'] = 사용자 표시 모드 이름 (그대로 씀, 바꾸지 않음)
+        if name in modes: return modes[name]
+        print('display mode not found:', name)
     if MODE in modes: dm = modes[MODE]
     else:
         dm = Rhino.Display.DisplayModeDescription.GetDisplayMode(
@@ -174,6 +177,37 @@ def _axis(cfg):
     return ax, i, c, n, o
 
 def _span(b, i): return (b.Min[i], b.Max[i])
+
+HOLES = collections.defaultdict(list)                 # _cut 이 채움: 재질별 속 빈 단면의 안쪽 고리
+GROUPS = collections.defaultdict(list)                # _cut 이 채움: 재질별 [덩어리마다 닫힌 고리들]
+
+
+def _material_regions(groups, pl, tol):
+    """속 빈 단면까지 맞게 합치기: 모든 고리로 평면을 영역으로 나누고(CreateBooleanRegions), 영역 안의 점이
+    어느 덩어리의 고리 안에 홀수 번 들면 재질. 재질 영역끼리 이웃하면 합침. → 바깥·안쪽 고리 목록 (해치는 홀짝으로 비움)"""
+    allc = [c for g in groups for c in g]
+    if not allc: return []
+    IN = Rhino.Geometry.PointContainment.Inside
+    try: R = Rhino.Geometry.Curve.CreateBooleanRegions(allc, pl, False, tol)
+    except Exception: return None
+    if R is None: return None
+    pts = []
+    for i in range(R.RegionCount):
+        loops = list(R.RegionCurves(i)); br = Rhino.Geometry.Brep.CreatePlanarBreps(loops, tol)
+        if not br: continue
+        f = br[0].Faces[0]; du, dv = f.Domain(0), f.Domain(1); pt = None
+        for su in (0.5, 0.3, 0.7, 0.15, 0.85):
+            for sv in (0.5, 0.3, 0.7, 0.15, 0.85):
+                u_, v_ = du.ParameterAt(su), dv.ParameterAt(sv)
+                if f.IsPointOnFace(u_, v_) == Rhino.Geometry.PointFaceRelation.Interior: pt = f.PointAt(u_, v_); break
+            if pt: break
+        if pt is None: continue
+        if any(sum(1 for c in g if c.Contains(pt, pl, tol) == IN) % 2 for g in groups): pts.append(pt)
+    if not pts: return []
+    R2 = Rhino.Geometry.Curve.CreateBooleanRegions(allc, pl, pts, True, tol)
+    out = []
+    for i in range(R2.RegionCount): out += list(R2.RegionCurves(i))
+    return out
 
 ORDER = ['WHITE', 'EARTH', 'CONC', 'MORTAR', 'STONE', 'INSUL', 'BRICK', 'WOOD', 'SOLID', 'STAIR']   # 나중 것이 위 (콘크리트 속 장선 등). 재료 모름은 맨 아래
 
@@ -220,8 +254,10 @@ def section(cfg, ls=None, skip=()):
         d.Views.Redraw(); return {'ground': g0}
     for k in [x for x in ORDER if x in sec]:
         cs = sec[k]
-        u = Rhino.Geometry.Curve.CreateBooleanUnion(cs, tol)   # 블록 이음매 없애기
-        regs = list(u) if u and len(u) > 0 else cs
+        regs = _material_regions(GROUPS.get(k, []), Plane(o, n), tol) if HOLES.get(k) else None   # 속 빈 단면이 있으면 영역 방식
+        if not regs:
+            u = Rhino.Geometry.Curve.CreateBooleanUnion(cs, tol)   # 블록 이음매 없애기 (보통 경우, 빠름)
+            regs = list(u) if u and len(u) > 0 else cs
         if k == 'STAIR':                                    # 평면 계단: 잘린 면 대신 잘림표시 (계단 폭을 비스듬히 가로지르는 지그재그)
             for cv in regs:
                 x = _wall_dir(cv)
@@ -530,7 +566,7 @@ def _cut(cfg, skip=()):
     tol = d.ModelAbsoluteTolerance
     ax, i_, c, n, o = _axis(cfg)
     cut = Plane(o, n)
-    sec = collections.defaultdict(list)
+    sec = collections.defaultdict(list); HOLES.clear(); GROUPS.clear()
     for top in list(d.Objects):
         if top.Attributes.LayerIndex in skip or top.Attributes.Space != Rhino.DocObjects.ActiveSpace.ModelSpace: continue
         try: b0 = top.Geometry.GetBoundingBox(False)
@@ -557,7 +593,12 @@ def _cut(cfg, skip=()):
             elif isinstance(g, Rhino.Geometry.Mesh):
                 pl = Rhino.Geometry.Intersect.Intersection.MeshPlane(g, cut)
                 if pl: cs = [p.ToNurbsCurve() for p in pl]
-            sec[k] += [x for x in cs if x.IsClosed]
+            cs = [x for x in cs if x.IsClosed]
+            if not cs: continue
+            GROUPS[k].append(cs)                           # 덩어리별 고리 묶음 (속 빈 단면 판정용)
+            for x in cs:                                   # 한 덩어리 안에서 다른 고리에 홀수 번 싸인 고리 = 구멍
+                n_in = sum(1 for y in cs if y is not x and y.Contains(x.PointAtStart, cut, tol) == Rhino.Geometry.PointContainment.Inside)
+                (HOLES[k] if n_in % 2 else sec[k]).append(x)
     return sec
 
 SCALES = [20, 30, 50, 75, 100, 150, 200, 250, 300, 500]
@@ -582,7 +623,7 @@ def clear_layer(path):
 
 def build(cfg):
     st = sc.sticky.setdefault('secl_state', {'layers': {}, 'objs': {}, 'pages': []})
-    _ensure_patterns(); dm = _mode(); mv = _model_view()
+    _ensure_patterns(); dm = _mode(cfg.get('display')); mv = _model_view()
     ax = cfg.get('axis', 'x'); c = float(cfg['cut']); look = cfg.get('look', -1); depth = float(cfg.get('depth', 0))
     scale = cfg.get('scale', 'auto'); scale = scale if scale == 'auto' else float(scale); tol = d.ModelAbsoluteTolerance
     ax, i_, c, n, o = _axis(cfg)
